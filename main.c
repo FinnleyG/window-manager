@@ -23,12 +23,14 @@ xcb_window_t menu_bar;
 uint8_t running = 1;
 int fd;
 
+typedef enum { MODE_STACKING, MODE_TILING } Mode;
+
 typedef struct {
 	xcb_window_t window_id;
 	char * name;
 	int name_len;
 	int x, y, width, height;
-	uint8_t floating;
+	uint8_t floating, fullscreen;
 	int min_width;
 	int min_height;
 	int max_width;
@@ -41,6 +43,7 @@ typedef struct {
 	Window * windows;
 	int window_count;
 	int active_window;
+	Mode mode;
 } Workspace;
 
 Workspace workspaces[WORKSPACE_COUNT];
@@ -64,6 +67,8 @@ static void move_to_workspace(void * args);
 static void set_active_workspace(void * args);
 static void closewm(void * args);
 static void launch(void * args);
+static void toggle_fullscreen(void * args);
+static void change_mode(void * args);
 static void close_window(void * args);
 static void shift_active_window(void * args);
 static void swap_with(void * args);
@@ -77,6 +82,8 @@ static Key keys[] = {
 	{ MOD1|MOD2, 0x006a, swap_with, (void*)&neg_one },
 	{ MOD1, 0x0071, close_window, NULL },
 	{ MOD1|MOD2, 0x0071, closewm, NULL },
+	{ MOD1, 0x0066, toggle_fullscreen, NULL },
+	{ MOD1, 0x0020, change_mode, NULL },
 	{ MOD1, 0x0031, set_active_workspace, (void*)(int[]){0} },
 	{ MOD1, 0x0032, set_active_workspace, (void*)(int[]){1} },
 	{ MOD1, 0x0033, set_active_workspace, (void*)(int[]){2} },
@@ -109,6 +116,9 @@ static void add_window(Window * window, Workspace * ws);
 static void remove_window(xcb_window_t window);
 static void handle_unmap_notify(xcb_generic_event_t * ev);
 static void handle_destory_notify(xcb_generic_event_t * ev);
+static void focus_window(xcb_window_t window);
+static void stack(Window * window);
+static void tile(Workspace * ws);
 static void setup_colors();
 static void setup();
 static void draw_menubar();
@@ -147,42 +157,87 @@ static void move_to_workspace(void * args) {
 	xcb_unmap_window(connection, win.window_id);
 	values[0] = XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE;
 	xcb_change_window_attributes_checked(connection, screen->root, XCB_CW_EVENT_MASK, values);
-	// dprintf(fd, "%i\n", ws->windows[ws->active_window].window_id);
-	// xcb_unmap_window(connection, ws->windows[ws->active_window].window_id);
+	focus_window(win.window_id);
+}
+
+static void toggle_fullscreen(void * args) {
+	(void)args;
+	Workspace * ws = &workspaces[active_workspace];
+	Window * win = &ws->windows[ws->active_window];
+
+	if(ws->window_count < 1) return;
+
+	uint32_t values[4];
+	if(win->fullscreen) {
+		win->fullscreen = 0;
+		values[0] = win->x;
+		values[1] = win->y;
+		values[2] = win->width;
+		values[3] = win->height;
+	} else {
+		win->fullscreen = 1;
+		values[0] = 0;
+		values[1] = 0;
+		values[2] = screen->width_in_pixels;
+		values[3] = screen->height_in_pixels;
+	}
+	xcb_configure_window(connection, win->window_id, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+	if(ws->mode == MODE_TILING) tile(ws);
+	xcb_flush(connection);
+
+}
+
+static void change_mode(void * args) {
+	(void)args;
+	Workspace * ws = &workspaces[active_workspace];
+	if(ws->mode == MODE_STACKING) {
+		ws->mode = MODE_TILING;
+		tile(ws);
+	} else {
+		ws->mode = MODE_STACKING;
+		for(int i = 0; i < ws->window_count; ++i) {
+			if(!ws->windows[i].floating && !ws->windows[i].fullscreen) stack(&ws->windows[i]);
+		}
+	}
 }
 
 static void close_window(void * args) {
 	(void)args;
 	Workspace * ws = &workspaces[active_workspace];
-	if(ws->window_count > 0) {
-		xcb_client_message_event_t * event = calloc(32, 1);
 
-		const char protocols_atom[] = "WM_PROTOCOLS";
-		const char delete_atom[] = "WM_DELETE_WINDOW";
-		xcb_intern_atom_cookie_t cookie_protocols =  xcb_intern_atom(connection, 1, strlen(protocols_atom), protocols_atom);
-		xcb_intern_atom_cookie_t cookie_delete =  xcb_intern_atom(connection, 1, strlen(delete_atom), delete_atom);
-		xcb_intern_atom_reply_t * reply_protocols = xcb_intern_atom_reply(connection, cookie_protocols, NULL);
-		xcb_intern_atom_reply_t * reply_delete = xcb_intern_atom_reply(connection, cookie_delete, NULL);
+	if(ws->window_count < 1) return;
 
-		event->window = ws->windows[ws->active_window].window_id;
-		event->response_type = XCB_CLIENT_MESSAGE;
-		event->format = 32;
-		event->type = reply_protocols->atom;
-		event->data.data32[0] = reply_delete->atom;
-		event->data.data32[1] = XCB_CURRENT_TIME;
-		xcb_send_event(connection, 0, event->window, XCB_EVENT_MASK_NO_EVENT, (char*)event);
-		xcb_flush(connection);
-		free(reply_protocols);
-		free(reply_delete);
-		free(event);
+	xcb_client_message_event_t * event = calloc(32, 1);
 
-		draw_menubar();
-	}
+	const char protocols_atom[] = "WM_PROTOCOLS";
+	const char delete_atom[] = "WM_DELETE_WINDOW";
+	xcb_intern_atom_cookie_t cookie_protocols =  xcb_intern_atom(connection, 1, strlen(protocols_atom), protocols_atom);
+	xcb_intern_atom_cookie_t cookie_delete =  xcb_intern_atom(connection, 1, strlen(delete_atom), delete_atom);
+	xcb_intern_atom_reply_t * reply_protocols = xcb_intern_atom_reply(connection, cookie_protocols, NULL);
+	xcb_intern_atom_reply_t * reply_delete = xcb_intern_atom_reply(connection, cookie_delete, NULL);
+
+	event->window = ws->windows[ws->active_window].window_id;
+	event->response_type = XCB_CLIENT_MESSAGE;
+	event->format = 32;
+	event->type = reply_protocols->atom;
+	event->data.data32[0] = reply_delete->atom;
+	event->data.data32[1] = XCB_CURRENT_TIME;
+	xcb_send_event(connection, 0, event->window, XCB_EVENT_MASK_NO_EVENT, (char*)event);
+	xcb_flush(connection);
+	free(reply_protocols);
+	free(reply_delete);
+	free(event);
+
+	draw_menubar();
 }
 
 static void shift_active_window(void * args) {
 	Workspace * ws = &workspaces[active_workspace];
 	if(ws->window_count < 1) return;
+	if(ws->windows[ws->active_window].fullscreen) {
+		const uint32_t values[] = { XCB_STACK_MODE_BELOW };
+		xcb_configure_window(connection, ws->windows[ws->active_window].window_id, XCB_CONFIG_WINDOW_STACK_MODE, values);
+	}
 	ws->active_window = ws->active_window + *(int*)args;
 	if(ws->active_window < 0)
 		ws->active_window = ws->window_count - 1;
@@ -191,11 +246,7 @@ static void shift_active_window(void * args) {
 	draw_menubar();
 
 	if(ws->active_window < 0) return;
-
-	const uint32_t values[] = { XCB_STACK_MODE_ABOVE };
-	xcb_configure_window(connection, ws->windows[ws->active_window].window_id, XCB_CONFIG_WINDOW_STACK_MODE, values);
-
-	xcb_set_input_focus(connection, XCB_INPUT_FOCUS_POINTER_ROOT, ws->windows[ws->active_window].window_id, XCB_CURRENT_TIME);
+	focus_window(ws->windows[ws->active_window].window_id);
 }
 
 static void swap_with(void * args) {
@@ -212,10 +263,8 @@ static void swap_with(void * args) {
 
 	ws->active_window = target_window;
 	draw_menubar();
-	const uint32_t values[] = { XCB_STACK_MODE_ABOVE };
-	xcb_configure_window(connection, ws->windows[ws->active_window].window_id, XCB_CONFIG_WINDOW_STACK_MODE, values);
-
-	xcb_set_input_focus(connection, XCB_INPUT_FOCUS_POINTER_ROOT, ws->windows[ws->active_window].window_id, XCB_CURRENT_TIME);
+	if(ws->mode == MODE_TILING) tile(ws);
+	focus_window(ws->windows[ws->active_window].window_id);
 }
 
 static void closewm(void * args) {
@@ -287,20 +336,20 @@ static void handle_map_request(xcb_generic_event_t * ev) {
 	Window new_window;
 	new_window.window_id = e->window;
 
-	xcb_get_property_reply_t * reply;
-	xcb_get_property_cookie_t cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 4);
-	if((reply = xcb_get_property_reply(connection, cookie, NULL))) {
-        int len = xcb_get_property_value_length(reply);
+	xcb_get_property_reply_t * name_reply;
+	xcb_get_property_reply_t * size_reply;
+	xcb_get_property_cookie_t name_cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 4);
+	xcb_get_property_cookie_t size_cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_WM_SIZE_HINTS, 0, 64);
+	if((name_reply = xcb_get_property_reply(connection, name_cookie, NULL))) {
+        	int len = xcb_get_property_value_length(name_reply);
 		new_window.name = malloc((len+1) * sizeof(char));
-		strncpy(new_window.name, xcb_get_property_value(reply), len);
+		strncpy(new_window.name, xcb_get_property_value(name_reply), len);
 		new_window.name[len] = '\0';
 		new_window.name_len = len;
     	}
-	free(reply);
+	free(name_reply);
  
-	xcb_get_property_reply_t * size_reply;
-	cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_WM_SIZE_HINTS, 0, 64);
-	if((size_reply = xcb_get_property_reply(connection, cookie, NULL))) {
+	if((size_reply = xcb_get_property_reply(connection, size_cookie, NULL))) {
 		new_window.min_width = *((int*)xcb_get_property_value(size_reply)+5);
 		new_window.min_height = *((int*)xcb_get_property_value(size_reply)+6);
 		new_window.max_width = *((int*)xcb_get_property_value(size_reply)+7);
@@ -342,16 +391,15 @@ static void handle_map_request(xcb_generic_event_t * ev) {
 	values[2] = new_window.width;
 	values[3] = new_window.height;
 	values[4] = 0;
-	xcb_configure_window(connection, e->window, XCB_CONFIG_WINDOW_X |
-		XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH |
-		XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
+	xcb_configure_window(connection, e->window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
 	xcb_flush(connection);
+
 	values[0] = XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE;
 	xcb_change_window_attributes_checked(connection, e->window,
 		XCB_CW_EVENT_MASK, values);
 
 	if ((e->window != 0) && (e->window != screen->root)) {
-		xcb_set_input_focus(connection, XCB_INPUT_FOCUS_POINTER_ROOT, e->window, XCB_CURRENT_TIME);
+		focus_window(e->window);
 	}
 
 	add_window(&new_window, ws);
@@ -362,6 +410,7 @@ static void add_window(Window * window, Workspace * ws) {
 	(ws->window_count)++;
 	ws->windows = reallocarray(ws->windows, ws->window_count, sizeof(Window));
 	ws->windows[ws->window_count-1] = *window;
+	if(ws->mode == MODE_TILING) tile(ws);
 }
 
 static void remove_window(xcb_window_t window) {
@@ -369,22 +418,16 @@ static void remove_window(xcb_window_t window) {
 		Workspace * ws = &workspaces[i];
 		for(int j = 0; j < ws->window_count; ++j) {
 			if(ws->windows[j].window_id == window) {
-				for(int k = j; k < ws->window_count-1; ++k) {
-					ws->windows[k] = ws->windows[k+1];
-				}	
-				(ws->window_count)--;
-				if(ws->active_window == ws->window_count) {
-					shift_active_window((void*)&neg_one);
-				} else {
-					const uint32_t values[] = { XCB_STACK_MODE_ABOVE };
-					xcb_configure_window(connection, ws->windows[ws->active_window].window_id, XCB_CONFIG_WINDOW_STACK_MODE, values);
-					xcb_set_input_focus(connection, XCB_INPUT_FOCUS_POINTER_ROOT, ws->windows[ws->active_window].window_id, XCB_CURRENT_TIME);
-				}
+				for(int k = j; k < ws->window_count-1; ++k) ws->windows[k] = ws->windows[k+1];
+
+				if(ws->active_window == --(ws->window_count)) ws->active_window--;
+				if(ws->active_window >= 0) focus_window(ws->windows[ws->active_window].window_id);
+
 				ws->windows = reallocarray(ws->windows, ws->window_count, sizeof(Window));
 				draw_menubar();
-				return;
 			}
 		}
+		if(ws->mode == MODE_TILING) tile(ws);
 	}
 }
 
@@ -416,6 +459,43 @@ static void handle_unmap_notify(xcb_generic_event_t * ev) {
 	// free(reply_fullscreen);
 	// free(reply);
 // }
+
+static void focus_window(xcb_window_t window) {
+	const uint32_t values[] = { XCB_STACK_MODE_ABOVE };
+	xcb_configure_window(connection, menu_bar, XCB_CONFIG_WINDOW_STACK_MODE, values);
+	xcb_configure_window(connection, window, XCB_CONFIG_WINDOW_STACK_MODE, values);
+	xcb_set_input_focus(connection, XCB_INPUT_FOCUS_POINTER_ROOT, window, XCB_CURRENT_TIME);
+}
+
+static void stack(Window * window) {
+	uint32_t values[4];
+	values[0] = 0;
+	values[1] = MENUBAR_HEIGHT;
+	values[2] = screen->width_in_pixels;
+	values[3] = screen->height_in_pixels - MENUBAR_HEIGHT;
+	xcb_configure_window(connection, window->window_id, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+}
+
+static void tile(Workspace * ws) {
+	if(ws->window_count < 1) return;
+	int tileable_window_count = 0;
+	for(int i = 0; i < ws->window_count; ++i) {
+		if(!ws->windows[i].floating && !ws->windows[i].fullscreen) ++tileable_window_count;
+	}
+
+	int secondary_window_height = (tileable_window_count > 1) ? (screen->height_in_pixels-MENUBAR_HEIGHT)/(tileable_window_count-1) : 0;
+	uint32_t values[4];
+	int j = 0;
+	for(int i = 0; i < ws->window_count; ++i) {
+		if(ws->windows[i].floating || ws->windows[i].fullscreen) continue;
+		values[0] = (j == 0) ? 0 : screen->width_in_pixels/2;
+		values[1] = (j == 0) ? MENUBAR_HEIGHT : MENUBAR_HEIGHT+(j-1)*secondary_window_height;
+		values[2] = (tileable_window_count > 1) ? screen->width_in_pixels/2 : screen->width_in_pixels;
+		values[3] = (j == 0) ? screen->height_in_pixels : secondary_window_height;
+		xcb_configure_window(connection, ws->windows[i].window_id, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+		++j;
+	}
+}
 
 static void setup_colors() {
 	int color_count = sizeof(color_codes)/sizeof(color_codes[0]);
@@ -481,7 +561,7 @@ static void draw_text(xcb_window_t window_id, int16_t x1, int16_t y1, const char
 
 
 static xcb_gc_t get_font_gc(xcb_window_t window, const char *font_name, uint32_t fg, uint32_t bg) {
-	xcb_font_t font = xcb_generate_id (connection);
+	xcb_font_t font = xcb_generate_id(connection);
 	xcb_void_cookie_t fontCookie = xcb_open_font_checked(connection, font, strlen(font_name), font_name);
 												
 	testCookie(fontCookie, "can't open font");
@@ -565,25 +645,27 @@ int main() {
 	setup_colors();
 
 	while(running) {
-		xcb_generic_event_t *ev = xcb_wait_for_event(connection);
-		if ((ev->response_type & ~0x80) == XCB_KEY_PRESS) {
+		xcb_generic_event_t * ev = xcb_wait_for_event(connection);
+		switch(ev->response_type & ~0x80) {
+		case XCB_KEY_PRESS:
 			handle_key_press(ev);
-		}
-		if ((ev->response_type & ~0x80) == XCB_MAP_REQUEST) {
+			break;
+		case XCB_MAP_REQUEST:
 			handle_map_request(ev);
-		}
-		if ((ev->response_type & ~0x80) == XCB_EXPOSE) {
+			break;
+		case XCB_EXPOSE:
 			draw_menubar();
-		}
-		if ((ev->response_type & ~0x80) == XCB_DESTROY_NOTIFY) {
+			break;
+		case XCB_DESTROY_NOTIFY:
 			handle_destory_notify(ev);
-		}
-		if ((ev->response_type & ~0x80) == XCB_UNMAP_NOTIFY) {
+			break;
+		case XCB_UNMAP_NOTIFY:
 			handle_unmap_notify(ev);
-		}
-		// if ((ev->response_type & ~0x80) == XCB_CLIENT_MESSAGE) {
+			break;
+		// case XCB_CLIENT_MESSAGE:
 		// 	handle_client_message(ev);
-		// }
+		// 	break;
+		}
 		free(ev);
 		xcb_flush(connection);
 	}
