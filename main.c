@@ -16,12 +16,16 @@
 #define MOD2 XCB_MOD_MASK_SHIFT
 
 #define MENUBAR_HEIGHT 30
+#define WORKSPACE_WIDTH 20
+#define INFO_WIDTH 100
+#define WORKSPACE_COUNT 9
 
 xcb_connection_t * connection;
 xcb_screen_t * screen;
 xcb_window_t menu_bar; 
 uint8_t running = 1;
 int fd;
+char info[50];
 
 typedef enum { MODE_STACKING, MODE_TILING } Mode;
 
@@ -36,8 +40,6 @@ typedef struct {
 	int max_width;
 	int max_height;
 } Window;
-
-#define WORKSPACE_COUNT 9
 
 typedef struct {
 	Window * windows;
@@ -60,8 +62,6 @@ char * terminalcmd[] = {"alacritty", NULL};
 char * menucmd[] = {"dmenu_run", "-h", STRINGIFY(MENUBAR_HEIGHT), NULL};
 int pos_one[] = {1};
 int neg_one[] = {-1};
-
-static void testCookie(xcb_void_cookie_t cookie, char *errMessage);
 
 static void move_to_workspace(void * args);
 static void set_active_workspace(void * args);
@@ -103,10 +103,10 @@ static Key keys[] = {
 	{ MOD1|MOD2, 0x0038, move_to_workspace, (void*)(int[]){7} },
 	{ MOD1|MOD2, 0x0039, move_to_workspace, (void*)(int[]){8} }
 };
-
-
-uint32_t color_codes[] = { 0x555555, 0x333333, 0x3333FF };
-xcb_gcontext_t * colors = NULL;
+enum { LIGHT_GRAY, DARK_GRAY, BLUE };
+uint32_t colors[] = { 0x555555, 0x333333, 0x3333FF };
+xcb_gcontext_t * gcs = NULL;
+xcb_gcontext_t * font_gcs = NULL;
 
 static xcb_keycode_t * xcb_get_keycodes(xcb_keysym_t keysym);
 static xcb_keysym_t xcb_get_keysym(xcb_keycode_t keycode);
@@ -114,17 +114,17 @@ static void handle_key_press(xcb_generic_event_t * ev);
 static void handle_map_request(xcb_generic_event_t * ev);
 static void add_window(Window * window, Workspace * ws);
 static void remove_window(xcb_window_t window);
-static void handle_unmap_notify(xcb_generic_event_t * ev);
 static void handle_destory_notify(xcb_generic_event_t * ev);
+static void handle_unmap_notify(xcb_generic_event_t * ev);
+static void handle_property_notify(xcb_generic_event_t * ev);
+static void handle_expose_event(xcb_generic_event_t * ev);
 static void focus_window(xcb_window_t window);
 static void stack(Window * window);
 static void tile(Workspace * ws);
-static void setup_colors();
+static void setup_gcs();
 static void setup();
+static void draw_info();
 static void draw_menubar();
-
-static xcb_gc_t get_font_gc(xcb_window_t window, const char * font_name, uint32_t fg, uint32_t bg);
-static void draw_text(xcb_window_t window, int16_t x1, int16_t y1, const char * label, uint32_t fg, uint32_t bg);
 
 static void set_active_workspace(void * args) {
 	if(active_workspace == *(int*)args) return;
@@ -141,6 +141,9 @@ static void set_active_workspace(void * args) {
 	xcb_change_window_attributes_checked(connection, screen->root, XCB_CW_EVENT_MASK, values);
 	for(int i = 0; i < new_ws->window_count; ++i) {
 		xcb_map_window(connection, new_ws->windows[i].window_id);
+		if(i == new_ws->active_window) {
+			focus_window(new_ws->windows[i].window_id);
+		}
 	}
 	draw_menubar();
 }
@@ -303,10 +306,10 @@ static xcb_keysym_t xcb_get_keysym(xcb_keycode_t keycode) {
 }
 
 static void handle_key_press(xcb_generic_event_t * ev) {
-	Workspace * ws = &workspaces[active_workspace];
+	// Workspace * ws = &workspaces[active_workspace];
 	xcb_key_press_event_t * e = (xcb_key_press_event_t*)ev;
 	xcb_keysym_t keysym = xcb_get_keysym(e->detail);
-	if(ws->active_window > -1 && e->child != ws->windows[ws->active_window].window_id) {
+	// if(ws->active_window > -1 && e->child != ws->windows[ws->active_window].window_id) {
 		// for(int i = 0; i < window_count; ++i) {
 		// 	if(windows[i].window_id == e->child) {
 		// 		active_window = i;	
@@ -315,7 +318,7 @@ static void handle_key_press(xcb_generic_event_t * ev) {
 		// 		break;
 		// 	}
 		// }
-	}
+	// }
 	int key_table_size = sizeof(keys) / sizeof(*keys);
 	for(int i = 0; i < key_table_size; ++i) {
 		if((keys[i].keysym == keysym) && (keys[i].mod == e->state)) {
@@ -336,9 +339,17 @@ static void handle_map_request(xcb_generic_event_t * ev) {
 	Window new_window;
 	new_window.window_id = e->window;
 
+	// char atom_name[] = "_NET_WM_NAME";
+	// char atom_type[] = "UTF8_STRING";
+	// xcb_intern_atom_cookie_t cookie_atom =  xcb_intern_atom(connection, 1, strlen(atom_name), atom_name);
+	// xcb_intern_atom_reply_t * reply_atom = xcb_intern_atom_reply(connection, cookie_atom, NULL);
+	// xcb_intern_atom_cookie_t cookie_type =  xcb_intern_atom(connection, 1, strlen(atom_type), atom_type);
+	// xcb_intern_atom_reply_t * reply_type = xcb_intern_atom_reply(connection, cookie_type, NULL);
+
 	xcb_get_property_reply_t * name_reply;
 	xcb_get_property_reply_t * size_reply;
 	xcb_get_property_cookie_t name_cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 4);
+	// xcb_get_property_cookie_t name_cookie = xcb_get_property(connection, 0, e->window, reply_atom->atom, reply_type->atom, 0, 4);
 	xcb_get_property_cookie_t size_cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_WM_SIZE_HINTS, 0, 64);
 	if((name_reply = xcb_get_property_reply(connection, name_cookie, NULL))) {
         	int len = xcb_get_property_value_length(name_reply);
@@ -411,6 +422,7 @@ static void add_window(Window * window, Workspace * ws) {
 	ws->windows = reallocarray(ws->windows, ws->window_count, sizeof(Window));
 	ws->windows[ws->window_count-1] = *window;
 	if(ws->mode == MODE_TILING) tile(ws);
+	draw_menubar();
 }
 
 static void remove_window(xcb_window_t window) {
@@ -439,6 +451,29 @@ static void handle_destory_notify(xcb_generic_event_t * ev) {
 static void handle_unmap_notify(xcb_generic_event_t * ev) {
 	xcb_unmap_notify_event_t * e = (xcb_unmap_notify_event_t*)ev;
 	remove_window(e->window);
+}
+
+static void handle_property_notify(xcb_generic_event_t * ev) {
+	xcb_property_notify_event_t * e = (xcb_property_notify_event_t*)ev;
+	if(e->window == screen->root && e->atom == XCB_ATOM_WM_NAME) {
+		xcb_get_property_reply_t * name_reply;
+		xcb_get_property_cookie_t name_cookie = xcb_get_property(connection, 0, e->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 0, 4);
+		if((name_reply = xcb_get_property_reply(connection, name_cookie, NULL))) {
+			int len = xcb_get_property_value_length(name_reply);
+			strncpy(info, xcb_get_property_value(name_reply), len);
+			info[len] = '\0';
+		}
+		free(name_reply);
+		draw_info();
+	}
+}
+
+static void handle_expose_event(xcb_generic_event_t * ev) {
+	xcb_expose_event_t * e = (xcb_expose_event_t *)ev;
+	if(e->window == menu_bar) {
+		draw_menubar();
+		draw_info();
+	}
 }
 
 // static void handle_client_message(xcb_generic_event_t * ev) {
@@ -497,14 +532,22 @@ static void tile(Workspace * ws) {
 	}
 }
 
-static void setup_colors() {
-	int color_count = sizeof(color_codes)/sizeof(color_codes[0]);
-	colors = (xcb_gcontext_t*)malloc(color_count * sizeof(xcb_gcontext_t));
+static void setup_gcs() {
+	int color_count = sizeof(colors)/sizeof(*colors);
+	gcs = (xcb_gcontext_t*)malloc(color_count * sizeof(xcb_gcontext_t));
+	font_gcs = (xcb_gcontext_t*)malloc(color_count * sizeof(xcb_gcontext_t));
+	uint32_t mask = XCB_GC_FOREGROUND;
+	uint32_t font_mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_FONT;
+	xcb_font_t font = xcb_generate_id(connection);
+	char font_name[] = "fixed";
+	xcb_open_font(connection, font, strlen(font_name), font_name);
 	for(int i = 0; i < color_count; ++i) {
-		colors[i] = xcb_generate_id(connection);
-		uint32_t mask = XCB_GC_FOREGROUND;
-		uint32_t value = color_codes[i];
-		xcb_create_gc(connection, colors[i], menu_bar, mask, &value);
+		gcs[i] = xcb_generate_id(connection);
+		font_gcs[i] = xcb_generate_id(connection);
+		uint32_t value = colors[i];
+		uint32_t font_values[3] = { screen->white_pixel, colors[i], font };
+		xcb_create_gc(connection, gcs[i], screen->root, mask, &value);
+		xcb_create_gc(connection, font_gcs[i], screen->root, font_mask, font_values);
 	}
 }
 
@@ -538,90 +581,50 @@ static void setup() {
 	}
 }
 
-static void testCookie(xcb_void_cookie_t cookie, char *errMessage) {
-	xcb_generic_error_t *error = xcb_request_check(connection, cookie);
-	if (error) {
-		dprintf(fd, "ERROR: %s : %i \n", errMessage , error->error_code);
-		xcb_disconnect(connection);
-		exit(-1);
-	}
+static void draw_info() {
+	xcb_rectangle_t rect = { screen->width_in_pixels-INFO_WIDTH, 0, INFO_WIDTH, MENUBAR_HEIGHT };
+	xcb_poly_fill_rectangle(connection, menu_bar, gcs[LIGHT_GRAY], 1, &rect);
+	xcb_image_text_8(connection, strlen(info), menu_bar, font_gcs[LIGHT_GRAY], screen->width_in_pixels-INFO_WIDTH+15, MENUBAR_HEIGHT-10, info);
 }
 
-static void draw_text(xcb_window_t window_id, int16_t x1, int16_t y1, const char *label, uint32_t fg, uint32_t bg) {
-	xcb_gcontext_t gc = get_font_gc(window_id, "fixed", fg, bg);
-
-	xcb_void_cookie_t textCookie = xcb_image_text_8_checked(connection, strlen(label), window_id, gc, x1, y1, label);
-
-	testCookie(textCookie, "can't paste text");
-
-	xcb_void_cookie_t gcCookie = xcb_free_gc(connection, gc);
-
-	testCookie(gcCookie, "can't free gc");
-}
-
-
-static xcb_gc_t get_font_gc(xcb_window_t window, const char *font_name, uint32_t fg, uint32_t bg) {
-	xcb_font_t font = xcb_generate_id(connection);
-	xcb_void_cookie_t fontCookie = xcb_open_font_checked(connection, font, strlen(font_name), font_name);
-												
-	testCookie(fontCookie, "can't open font");
-
-	xcb_gcontext_t gc = xcb_generate_id(connection);
-	uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_FONT;
-	uint32_t value_list[3] = { fg, bg, font };
-									  
-	xcb_void_cookie_t gcCookie = xcb_create_gc_checked(connection, gc, window, mask, value_list);
-
-	testCookie(gcCookie, "can't create gc");
-
-	fontCookie = xcb_close_font_checked(connection, font);
-
-	testCookie(fontCookie, "can't close font");
-
-	return gc;
-}
-
-#define WORKSPACE_WIDTH 20
 static void draw_menubar() {
-	xcb_clear_area(connection, 0, menu_bar, 0, 0, screen->width_in_pixels, MENUBAR_HEIGHT);
+	xcb_rectangle_t rect = { 0, 0, screen->width_in_pixels-INFO_WIDTH, MENUBAR_HEIGHT };
+	xcb_poly_fill_rectangle(connection, menu_bar, gcs[LIGHT_GRAY], 1, &rect);
 
 	int col;
 	for(int i = 0; i < WORKSPACE_COUNT; ++i) {
 		if(i == active_workspace)
-			col = 2;
+			col = BLUE;
 		else
-			col = 0;
-		xcb_rectangle_t rect = { WORKSPACE_WIDTH*i, 0, WORKSPACE_WIDTH, MENUBAR_HEIGHT };
-		xcb_poly_fill_rectangle(connection, menu_bar, colors[col], 1, &rect);
+			col = LIGHT_GRAY;
+		int x = WORKSPACE_WIDTH*i;
+		xcb_rectangle_t rect = { x, 0, WORKSPACE_WIDTH, MENUBAR_HEIGHT };
+		xcb_poly_fill_rectangle(connection, menu_bar, gcs[col], 1, &rect);
 		char num[2];
 		sprintf(num, "%i", i+1);
-		draw_text(menu_bar, WORKSPACE_WIDTH/2+WORKSPACE_WIDTH*i, MENUBAR_HEIGHT - 10, num, screen->white_pixel, color_codes[col]);
-		if(workspaces[i].window_count > 0) {
-			xcb_rectangle_t rect2 = { WORKSPACE_WIDTH*i, 0, 5, 5 };
-			xcb_poly_fill_rectangle(connection, menu_bar, colors[2], 1, &rect2);
-		}
+		xcb_image_text_8(connection, strlen(num), menu_bar, font_gcs[col], WORKSPACE_WIDTH/2+x-1, MENUBAR_HEIGHT-10, num);
+		if(workspaces[i].window_count > 0) xcb_clear_area(connection, 0, menu_bar, x, 0, 4, 4);
 	}
-
+	
 	Workspace * ws = &workspaces[active_workspace];
 	if(ws->window_count == 0) return;
 
-	int tab_width = (screen->width_in_pixels-WORKSPACE_WIDTH*WORKSPACE_COUNT)/ws->window_count;
+	int tab_width = (screen->width_in_pixels-WORKSPACE_WIDTH*WORKSPACE_COUNT-INFO_WIDTH)/ws->window_count;
 
 	for(int i = 0; i < ws->window_count; ++i) {
 		xcb_rectangle_t rect = { tab_width*i+WORKSPACE_WIDTH*WORKSPACE_COUNT, 0, tab_width, MENUBAR_HEIGHT };
 		if(i == ws->active_window)
-			col = 2;
+			col = BLUE;
 		else
-			col = i%2;
-		xcb_poly_fill_rectangle(connection, menu_bar, colors[col], 1, &rect);
-		draw_text(menu_bar, 30+tab_width*i+WORKSPACE_WIDTH*WORKSPACE_COUNT, MENUBAR_HEIGHT - 10, ws->windows[i].name, screen->white_pixel, color_codes[col]);
+			col = i % 2; //alternate between dark and light gray
+		xcb_poly_fill_rectangle(connection, menu_bar, gcs[col], 1, &rect);
+		xcb_image_text_8(connection, strlen(ws->windows[i].name), menu_bar, font_gcs[col], 15+tab_width*i+WORKSPACE_WIDTH*WORKSPACE_COUNT, MENUBAR_HEIGHT-10, ws->windows[i].name);
 	}
 	xcb_flush(connection);
 }
 
 int main() {
 	connection = xcb_connect(NULL, NULL);
-
 	if(xcb_connection_has_error(connection)) { 
 		printf("Connection failed.\n");
 		return 1;
@@ -638,14 +641,14 @@ int main() {
 	prop_values[1] = XCB_EVENT_MASK_EXPOSURE;
 
 	xcb_create_window(connection, screen->root_depth, menu_bar, screen->root, 0, 0, screen->width_in_pixels, MENUBAR_HEIGHT, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, prop_names, prop_values);
-
 	xcb_map_window(connection, menu_bar);
 	xcb_flush(connection);
 
-	setup_colors();
+	setup_gcs();
 
 	while(running) {
 		xcb_generic_event_t * ev = xcb_wait_for_event(connection);
+		if(!ev) continue;
 		switch(ev->response_type & ~0x80) {
 		case XCB_KEY_PRESS:
 			handle_key_press(ev);
@@ -654,13 +657,16 @@ int main() {
 			handle_map_request(ev);
 			break;
 		case XCB_EXPOSE:
-			draw_menubar();
+			handle_expose_event(ev);
 			break;
 		case XCB_DESTROY_NOTIFY:
 			handle_destory_notify(ev);
 			break;
 		case XCB_UNMAP_NOTIFY:
 			handle_unmap_notify(ev);
+			break;
+		case XCB_PROPERTY_NOTIFY:
+			handle_property_notify(ev);
 			break;
 		// case XCB_CLIENT_MESSAGE:
 		// 	handle_client_message(ev);
@@ -671,9 +677,9 @@ int main() {
 	}
 
 	close(fd);
-	free(colors);
-	if(connection != NULL) {
+	free(gcs);
+	free(font_gcs);
+	if(connection != NULL)
 		xcb_disconnect(connection);
-	}
 	return 0;
 }
